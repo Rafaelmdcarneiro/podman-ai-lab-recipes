@@ -1,0 +1,8 @@
+FROM registry.access.redhat.com/ubi9/python-311:1-62.1714671026
+ARG PORT=8000
+WORKDIR /app
+COPY src .
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir --upgrade -r requirements.txt
+EXPOSE $PORT
+ENTRYPOINT [ "sh", "./run.sh" ]
