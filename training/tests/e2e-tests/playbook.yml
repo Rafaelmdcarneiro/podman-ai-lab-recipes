@@ -1,0 +1,39 @@
+---
+- name: Test Environment Provisioning
+  hosts: test_environments
+  remote_user: root
+  become: true
+  gather_facts: false
+
+  tasks:
+  
+  - name: Wait until the instance is ready
+    ansible.builtin.wait_for_connection:
+    delay: 15
+    timeout: 180
+  
+  - name: Gather facts for first time
+    ansible.builtin.setup:
+
+  - name: Get test script
+    ansible.builtin.get_url:
+      url: https://raw.githubusercontent.com/instructlab/instructlab/main/scripts/basic-workflow-tests.sh
+      dest: /tmp/basic-workflow-tests.sh
+      mode: 755
+
+  # Allow for debugging with tmate
+  # - name: Wait for 15 minutes
+  #   pause:
+  #     minutes: 15
+
+  - name: Run tests
+    ansible.builtin.shell: /tmp/basic-workflow-tests.sh
+    register: out
+
+  - name: Test Results - stdout
+    debug:
+      msg: "{{out.stdout_lines}}"
+
+  - name: Test Results - stderr
+    debug:
+      msg: "{{out.stderr_lines}}"
