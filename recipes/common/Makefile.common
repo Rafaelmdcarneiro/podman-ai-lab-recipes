@@ -1,0 +1,229 @@
+REGISTRY ?= quay.io
+REGISTRY_ORG ?= ai-lab
+
+IMAGE_NAME ?= $(REGISTRY_ORG)/${APP}:latest
+APP_IMAGE ?= $(REGISTRY)/$(IMAGE_NAME)
+CHROMADB_IMAGE ?= $(REGISTRY)/$(REGISTRY_ORG)/chromadb:latest
+MODEL_IMAGE ?= $(REGISTRY)/$(REGISTRY_ORG)/granite-7b-lab:latest
+SERVER_IMAGE ?= $(REGISTRY)/$(REGISTRY_ORG)/llamacpp_python:latest
+SSH_PUBKEY ?= $(shell cat ${HOME}/.ssh/id_rsa.pub;)
+BOOTC_IMAGE ?= quay.io/$(REGISTRY_ORG)/${APP}-bootc:latest
+BOOTC_IMAGE_BUILDER ?= quay.io/centos-bootc/bootc-image-builder
+DISK_TYPE ?= qcow2
+DISK_UID ?= $(shell id -u)
+DISK_GID ?= $(shell id -g)
+FROM ?=
+ARCH ?=
+CONTAINERFILE ?= Containerfile
+GRAPH_ROOT=$(shell podman info --format '{{ .Store.GraphRoot }}')
+UMASK=$(shell umask)
+
+ROOTLESS_AUTH_JSON=${XDG_RUNTIME_DIR}/containers/auth.json
+ROOTFUL_AUTH_JSON=/run/containers/0/auth.json
+NONLINUX_AUTH_JSON=${HOME}/.config/containers/auth.json
+AUTH_JSON ?=
+
+ifneq ("$(wildcard $(NONLINUX_AUTH_JSON))","")
+	AUTH_JSON=$(NONLINUX_AUTH_JSON)
+else ifneq ("$(wildcard $(ROOTLESS_AUTH_JSON))","")
+	AUTH_JSON=$(ROOTLESS_AUTH_JSON)
+else ifneq ("$(wildcard $(ROOTFUL_AUTH_JSON))","")
+	AUTH_JSON=$(ROOTFUL_AUTH_JSON)
+endif
+
+CHROMEDRIVER_VERSION := 103.0.5060.53
+CHROMEDRIVER_MIRROR := https://chromedriver.storage.googleapis.com
+CHROMEDRIVER_DOWNLOAD_PATH := 
+RECIPE_BINARIES_PATH ?=
+CHROME_DOWNLOAD_PATH ?=
+
+OS := $(shell uname -s)
+ARCH := $(shell uname -m)
+ifeq ($(ARCH),x86_64)
+	ARCH := amd64
+endif
+
+ifeq ($(OS),Darwin) # This structure may vary if we upgrade chromedriver, see index: https://chromedriver.storage.googleapis.com/index.html
+	ifeq ($(ARCH),amd64)
+		CHROMEDRIVER_DOWNLOAD_PATH := chromedriver_mac64.zip
+	else ifeq ($(ARCH),arm64)
+		CHROMEDRIVER_DOWNLOAD_PATH := chromedriver_mac64_m1.zip
+	endif
+	CHROME_DOWNLOAD_PATH := googlechrome.dmg
+else ifeq ($(OS),Linux)
+	CHROMEDRIVER_DOWNLOAD_PATH := chromedriver_linux64.zip
+	CHROME_DOWNLOAD_PATH := google-chrome-stable_current_$(ARCH).deb
+endif
+
+CHROME_MIRROR := https://www.slimjet.com/chrome/files/$(CHROMEDRIVER_VERSION)/$(CHROME_DOWNLOAD_PATH)
+
+LOCAL_CHROMEDRIVER_EXISTS ?= $(shell command -v $(RECIPE_BINARIES_PATH)/chromedriver)
+UNZIP_EXISTS ?= $(shell command -v unzip)
+
+RELATIVE_MODELS_PATH := ?=
+RELATIVE_TESTS_PATH := ?=
+
+GRANITE_MODEL_NAME := granite-7b-lab-Q4_K_M.gguf
+GRANITE_MODEL_URL := https://huggingface.co/instructlab/granite-7b-lab-GGUF/resolve/main/granite-7b-lab-Q4_K_M.gguf
+
+MODEL_NAME ?= $(GRANITE_MODEL_NAME)
+
+.PHONY: install
+install::
+	$(MAKE) install-chromedriver RECIPE_BINARIES_PATH=${RECIPE_BINARIES_PATH}
+	$(MAKE) install-chrome RECIPE_BINARIES_PATH=${RECIPE_BINARIES_PATH}
+	pip install -q -r ${RELATIVE_TESTS_PATH}/requirements.txt
+
+.PHONY: build
+build:
+	podman build --squash-all $(ARCH:%=--platform linux/%) $(FROM:%=--from %) -t ${APP_IMAGE} app/
+
+.PHONY: bootc
+bootc: quadlet growfs
+	podman build \
+	  $(ARCH:%=--arch %) \
+	  $(FROM:%=--from %) \
+	  $(AUTH_JSON:%=-v %:/run/containers/0/auth.json) \
+	  --security-opt label=disable \
+	  --cap-add SYS_ADMIN \
+	  --build-arg MODEL_IMAGE=$(MODEL_IMAGE) \
+	  --build-arg APP_IMAGE=$(APP_IMAGE) \
+	  --build-arg SERVER_IMAGE=$(SERVER_IMAGE) \
+	  --build-arg "SSHPUBKEY=$(SSH_PUBKEY)" \
+	  -f bootc/$(CONTAINERFILE) \
+	  -t ${BOOTC_IMAGE} bootc
+	@echo ""
+	@echo "Successfully built bootc image '${BOOTC_IMAGE}'."
+	@echo "You may now convert the image into a disk image via bootc-image-builder"
+	@echo "or the Podman Desktop Bootc Extension.  For more information, please refer to"
+	@echo "   * https://github.com/osbuild/bootc-image-builder"
+	@echo "   * https://github.com/containers/podman-desktop-extension-bootc"
+
+.PHONY: bootc-run
+bootc-run:
+	podman run -d --rm --name $(APP)-bootc -p 8080:8501 --privileged \
+	  $(AUTH_JSON:%=-v %:/run/containers/0/auth.json) \
+	  $(BOOTC_IMAGE) /sbin/init
+
+.PHONY: bootc-image-builder
+bootc-image-builder:
+	@if podman image exists $(BOOTC_IMAGE); then \
+		echo "$(BOOTC_IMAGE) exists in local storage, using it"; \
+	else \
+		$(MAKE) bootc; \
+	fi
+	mkdir -p build/store
+	podman run \
+	  --rm \
+	  -ti \
+	  -v $(GRAPH_ROOT):/var/lib/containers/storage \
+	  $(ARCH:%=--arch %) \
+	  $(AUTH_JSON:%=-v %:/run/containers/0/auth.json) \
+	  --privileged \
+	  --pull newer \
+	  -v ./build:/output \
+	  -v ./build/store:/store \
+	  $(BOOTC_IMAGE_BUILDER) \
+	  $(ARCH:%=--target-arch %) \
+	  --type $(DISK_TYPE) \
+	  --chown $(DISK_UID):$(DISK_GID) \
+	  --local \
+	  $(BOOTC_IMAGE)
+
+.PHONY: install-chromedriver
+install-chromedriver:
+	@if [[ -z "$(LOCAL_CHROMEDRIVER_EXISTS)" ]]; then \
+		if [[ -n "$(UNZIP_EXISTS)" ]]; then \
+			curl --progress-bar --max-time 3000 --connect-timeout 60 -LO $(CHROMEDRIVER_MIRROR)/$(CHROMEDRIVER_VERSION)/$(CHROMEDRIVER_DOWNLOAD_PATH); \
+			unzip $(CHROMEDRIVER_DOWNLOAD_PATH); \
+			mv chromedriver $(RECIPE_BINARIES_PATH)/; \
+			rm ./$(CHROMEDRIVER_DOWNLOAD_PATH); \
+		elif [[ -z "$(UNZIP_EXISTS)" ]]; then \
+			echo "Install make target requires unizp binary."; \
+			exit 1; \
+		fi; \
+	fi;
+
+.PHONY: install-chrome
+install-chrome:
+	curl --progress-bar --max-time 3000 --connect-timeout 60 -LO $(CHROME_MIRROR)
+	@if [[ "$(OS)" == "Linux" ]]; then \
+		sudo dpkg -i $(CHROME_DOWNLOAD_PATH); \
+	elif [[ "$(OS)" == "Darwin" ]]; then \
+		open $(CHROME_DOWNLOAD_PATH); \
+		ls "/Volumes/Google Chrome/Google Chrome.app/Contents/MacOS/Google Chrome"; \
+		cp -pr "/Volumes/Google Chrome/Google Chrome.app" "$(RECIPE_BINARIES_PATH)/"; \
+		diskutil unmount "/Volumes/Google Chrome" || true; \
+		rm $(CHROME_DOWNLOAD_PATH); \
+	fi;
+
+.PHONY: check-umask
+check-umask:
+	@test "$(UMASK)" = "0022" || \
+		(echo; echo -n "Error: umask $(UMASK) will cause unexpected behaviour: use umask 022! "; \
+		 echo "Verify the `ai-lab-recipes` git repository was cloned with umask 0022"; exit 1)
+
+.PHONY: growfs
+growfs: quadlet check-umask
+	# Add growfs service
+	mkdir -p build; cp -pR ../../common/usr build/
+
+.PHONY: quadlet
+quadlet:
+	# Modify quadlet files to match the server, model and app image
+	rm -rf build; mkdir -p bootc/build; ln -sf bootc/build .
+	sed -e "s|SERVER_IMAGE|${SERVER_IMAGE}|" \
+	    -e "s|APP_IMAGE|${APP_IMAGE}|g" \
+	    -e "s|MODEL_IMAGE|${MODEL_IMAGE}|g" \
+	    -e "s|APP|${APP}|g" \
+	    quadlet/${APP}.image \
+	    > build/${APP}.image
+	sed -e "s|SERVER_IMAGE|${SERVER_IMAGE}|" \
+	    -e "s|APP_IMAGE|${APP_IMAGE}|g" \
+	    -e "s|MODEL_IMAGE|${MODEL_IMAGE}|g" \
+	    quadlet/${APP}.yaml \
+	    > build/${APP}.yaml
+	cp -p quadlet/${APP}.kube build/${APP}.kube
+
+.PHONY: run
+run: 
+	podman run -it -p $(PORT):$(PORT) -e MODEL_ENDPOINT=http://10.88.0.1:8001 ${APP_IMAGE}
+
+.PHONY: clean
+clean:
+	-rm -rf build bootc/build
+	-rm -rf tests/__pycache__
+	-rm -f ./$(MODEL_NAME) &> /dev/null
+
+.PHONY: check-model-in-path
+check-model-in-path:
+	@if [ ! -f "../../../models/$(MODEL_NAME)" ]; then \
+		echo "Model file -- $(MODEL_NAME) -- not present in the models directory."; \
+		exit 1; \
+	else \
+		if [ ! -f "./$(MODEL_NAME)" ]; then \
+            ln -s ../../../models/$(MODEL_NAME) ./$(MODEL_NAME); \
+        fi; \
+	fi;
+
+.PHONY: functional-tests
+functional-tests:
+	$(MAKE) MODEL_NAME=$(MODEL_NAME) check-model-in-path 
+	@if [[ -n "$(LOCAL_CHROMEDRIVER_EXISTS)" ]]; then \
+		IMAGE_NAME=${IMAGE_NAME} REGISTRY=${REGISTRY} MODEL_NAME=${MODEL_NAME} pytest -vvv --driver=Chrome --driver-path=$(RECIPE_BINARIES_PATH)/chromedriver ${RELATIVE_TESTS_PATH}/functional; \
+	else \
+		echo "fetching chromedriver"; \
+		make install; \
+		IMAGE_NAME=${IMAGE_NAME} REGISTRY=${REGISTRY} MODEL_NAME=${MODEL_NAME} pytest -vvv --driver=Chrome --driver-path=$(RECIPE_BINARIES_PATH)/chromedriver ${RELATIVE_TESTS_PATH}/functional; \
+	fi;
+
+.PHONY: integration-tests
+integration-tests:
+	@if [[ -n "$(LOCAL_CHROMEDRIVER_EXISTS)" ]]; then \
+		URL=${URL} IMAGE_NAME=${IMAGE_NAME} REGISTRY=${REGISTRY} pytest -vvv --driver=Chrome --driver-path=$(RECIPE_BINARIES_PATH)/chromedriver ${RELATIVE_TESTS_PATH}/integration; \
+	else \
+		echo "fetching chromedriver"; \
+		make install; \
+		URL=${URL} IMAGE_NAME=${IMAGE_NAME} REGISTRY=${REGISTRY} pytest -vvv --driver=Chrome --driver-path=$(RECIPE_BINARIES_PATH)/chromedriver ${RELATIVE_TESTS_PATH}/integration; \
+	fi;
+
